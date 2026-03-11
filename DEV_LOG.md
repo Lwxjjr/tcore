@@ -1,5 +1,64 @@
 # Bitcask IoT 开发日志
 
+## 2026-03-11
+
+### 🏛️ 架构反思：借鉴 tstorage 的扁平化分区思路
+
+在研究高性能 TSDB 库 `tstorage` 后，对比了 `bitcask-iot` 当前的“传感器中心化”架构，发现了在大规模场景下的潜在瓶颈。
+
+#### 1. 架构对比示意图
+
+**【当前：传感器中心化 (Sensor-Centric)】**
+```text
+[ DB (Entry) ]
+  │
+  ├── [ Index (Global) ]
+  │     ├── Series "Sensor_A" ── [ activeBuffer (Hot) ] + [ BlockMetas (Cold Index) ]
+  │     ├── Series "Sensor_B" ── [ activeBuffer (Hot) ] + [ BlockMetas (Cold Index) ]
+  │     └─ ... (10,000+ Series)
+  └── [ Manager (Physical) ] ── [ Segment.vlog ] (物理追加)
+```
+
+**【目标：时间分片中心化 (Time-Partitioned / tstorage Style)】**
+```text
+[ Storage (Entry) ]
+  └── [ PartitionList (Time-Ordered) ]
+        ├── Node 1: [ MemoryPartition (Active/Hot) ]  <-- 全局写入点 (Map[ID][]Point)
+        ├── Node 2: [ DiskPartition (ReadOnly/Cold) ] <-- 压缩后的磁盘映射 (mmap)
+        └── Node 3: [ DiskPartition (ReadOnly/Cold) ]
+```
+
+#### 2. 核心差异与现有问题分析
+
+*   **内存碎片 (Memory Bloat)**：
+    *   *现状*：10,000 个传感器对应 10,000 个 `activeBuffer` 切片。由于 Go slice 的扩容机制和碎片化，小传感器多时内存浪费严重。
+    *   *优化*：改用 `MemoryPartition` 后，所有传感器在同一时间窗口内共享大 Map，内存更连续，GC 友好。
+*   **落盘碎片化 (Flush Complexity)**：
+    *   *现状*：按传感器落盘，导致 `.vlog` 文件中 Block 极其细碎（不同传感器交织），读取历史数据时 IOPS 极高。
+    *   *优化*：按时间整块落盘，一小时内所有数据一次性顺序写入，大幅提升磁盘吞吐。
+*   **过期删除 (Retention) 困境**：
+    *   *现状*：删除旧数据需遍历所有 `Series` 对象去清理 `BlockMetas`，复杂度 O(N*M)。
+    *   *优化*：只需从 `PartitionList` 尾部移除对应的 `DiskPartition` 节点并物理删除文件，复杂度 O(1)。
+*   **状态竞争 (Lock Contention)**：
+    *   *现状*：读写/查询 Series 需频繁竞争对象锁，且 `blocks` 列表随时间无限增长。
+    *   *优化*：`DiskPartition` 是不可变的（Immutable），查询冷数据无锁化；仅 `MemoryPartition` 需要写入锁。
+
+#### 3. 下一步演进思路 (The Go Way)
+
+你的架构目前的定位： 这是一个非常好的 Bitcask 模型变种。它的优点是“读某个传感器的最新数据极快”，因为它直接在Series 里就定位到了。
+
+
+如果你要面对的是真实的 IoT 场景（高频写入、海量设备、有过期需求）：
+   1. 引入 Partition 概念：不要让 Series 管理冷数据索引，让 Partition 管理。
+   2. 扁平化 Series：Series 应该只是一段逻辑逻辑 ID，不应该是一个沉重的管理类。
+   3. 接口化存储：像 tstorage 一样定义 Partition 接口，让 DB 面对的是“一组时间分片”，而不是“一堆传感器”。
+
+1.  **定义 `Partition` 接口**：解耦“内存形态”与“磁盘形态”，通过行为驱动而非结构嵌套。
+2.  **引入 `PartitionList`**：作为 `DB` 的核心数据容器，管理分区的生命周期。
+3.  **实现 Swap 机制**：后台异步将 `MemoryPartition` 转换为 `DiskPartition` 并实现原子替换。
+
+---
+
 ## 2026-2-27
 
 
@@ -91,7 +150,7 @@
 ### 💡 数据结构重构重点 (Bitcask -> IoT)
 
 *   **聚合：从"点"到"块"**：
-    放弃单点存储，改为 **Block (块)** 存储。内存索引不再记录每个数据点，而是记录块的时间范围和物理位置。内存消耗降低 99%，支持快速范围查询。
+    放弃单点存储，改为 **Block (块)** 存储。内存索引不再记录每个数据点，而是记录块的时间范围 and 物理位置。内存消耗降低 99%，支持快速范围查询。
 *   **压缩：String -> uint32 ID**：
     引入 ID 映射机制。磁盘不再存储冗长的传感器名称，统一使用 4 字节 ID。在万级传感器场景下，大幅减少存储冗余。
 *   **进化：Hash -> 稀疏索引**：
