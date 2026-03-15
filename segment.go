@@ -1,129 +1,253 @@
-package core
+package tcore
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 )
 
-const (
-	SegmentFileNamePrefix = "seg-"
-	SegmentFileNameSuffix = ".vlog"
-	HintFileNameSuffix    = ".hint" // 🌟 新增：伴生索引文件的后缀
-)
+/*
+l (分区列表)
+	│
+	├── head ──→ [Mutable chunk 1] ←── 最新分区（可写）
+	│              │ next
+	│              ↓
+	│           [Mutable chunk 2] ←── 次新分区（可写，用于乱序）
+	│              │ next
+	│              ↓
+	│           [Immutable chunk 1]   ←── 只读
+	│              │ next
+	│              ↓
+	│           [Immutable chunk 2]   ←── 只读
+	│              │ next
+	│              ↓
+	│           [Immutable chunk 3]   ←── 最旧分区
+	│              │ next = nil
+	│
+	└── tail ──→ [Immutable chunk 3]   ←── 尾指针
+*/
 
-// 🛠️ 修改：让工具函数支持指定后缀，方便复用
-func getFilePath(dir string, id uint32, suffix string) string {
-	return filepath.Join(dir, fmt.Sprintf("%s%06d%s", SegmentFileNamePrefix, id, suffix))
+type chunkList struct {
+	numChunks int64
+	head      *chunkNode
+	tail      *chunkNode
+	mu        sync.RWMutex
 }
 
-// Segment 代表一个纯粹的物理数据分片 (包含数据文件和索引文件)
-type Segment struct {
-	mu          sync.RWMutex
-	ID          uint32
-	File        *os.File // 真实数据文件 (.vlog)
-	HintFile    *os.File // 🌟 新增：伴生索引文件 (.hint)
-	WriteOffset int64
+func newchunkList() *chunkList {
+	return &chunkList{}
 }
 
-// NewSegment 打开或创建一个 Segment 文件组合
-// 🛠️ 修改：参数从 path 改为 dir，因为要同时创建两个文件
-func newSegment(dir string, id uint32) (*Segment, error) {
-	vlogPath := getFilePath(dir, id, SegmentFileNameSuffix)
-	hintPath := getFilePath(dir, id, HintFileNameSuffix)
-
-	// 1. 打开数据文件
-	f, err := os.OpenFile(vlogPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
-	if err != nil {
-		return nil, err
+func (l *chunkList) getHead() chunk {
+	if l.count() <= 0 {
+		return nil
 	}
-
-	// 🌟 2. 打开伴生索引文件
-	hf, err := os.OpenFile(hintPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
-	if err != nil {
-		f.Close() // 容错：防止文件句柄泄露
-		return nil, err
-	}
-
-	stat, err := f.Stat()
-	if err != nil {
-		f.Close()
-		hf.Close()
-		return nil, err
-	}
-
-	return &Segment{
-		ID:          id,
-		File:        f,
-		HintFile:    hf, // 🌟 塞入句柄
-		WriteOffset: stat.Size(),
-	}, nil
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.head.chunk()
 }
 
-// Write 极其纯粹的物理写入！只认字节流，不管业务逻辑
-func (s *Segment) write(data []byte) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	offset := s.WriteOffset
-	if _, err := s.File.Write(data); err != nil {
-		return 0, err
+func (l *chunkList) insert(chunk chunk) {
+	node := &chunkNode{
+		c: chunk,
+	}
+	l.mu.RLock()
+	head := l.head
+	l.mu.RUnlock()
+	if head != nil {
+		node.next = head
 	}
 
-	s.WriteOffset += int64(len(data))
-	return offset, nil
+	l.setHead(node)
+	atomic.AddInt64(&l.numChunks, 1)
 }
 
-// ReadAt 提供极其纯粹的物理读取
-func (s *Segment) readAt(size uint32, offset int64) ([]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	data := make([]byte, size)
-	if _, err := s.File.ReadAt(data, offset); err != nil {
-		return nil, err
+func (l *chunkList) remove(target chunk) error {
+	if l.count() <= 0 {
+		return fmt.Errorf("emchunkListty chunk")
 	}
 
-	return data, nil
-}
-
-// Size 获取当前文件的大小（线程安全），用于 Manager 判断轮转
-func (s *Segment) size() int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.WriteOffset
-}
-
-// Sync 强制将 Page Cache 刷入磁盘
-func (s *Segment) Sync() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if err := s.File.Sync(); err != nil {
-		return err
-	}
-	// 🌟 新增：顺手把 hint 也刷入磁盘
-	if s.HintFile != nil {
-		return s.HintFile.Sync()
-	}
-	return nil
-}
-
-// Close 关闭文件
-func (s *Segment) close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var err error
-	if e := s.File.Close(); e != nil {
-		err = e
-	}
-	// 🌟 新增：关闭 hint 文件句柄
-	if s.HintFile != nil {
-		if e := s.HintFile.Close(); e != nil {
-			err = e
+	// 从头开始遍历自身。
+	var prev, next *chunkNode
+	iterator := l.newIterator()
+	for iterator.next() {
+		current := iterator.currentNode()
+		if !samechunks(current.chunk(), target) {
+			prev = current
+			continue
 		}
+
+		// 删除当前节点。
+
+		iterator.next()
+		next = iterator.currentNode()
+		switch {
+		case prev == nil:
+			// 删除头节点
+			l.setHead(next)
+		case next == nil:
+			// 删除尾节点
+			prev.setNext(nil)
+			l.setTail(prev)
+		default:
+			// 删除中间节点
+			prev.setNext(next)
+		}
+		atomic.AddInt64(&l.numChunks, -1)
+
+		if err := current.chunk().clean(); err != nil {
+			return fmt.Errorf("failed to clean resources managed by chunk to be removed: %w", err)
+		}
+		return nil
 	}
-	return err
+
+	return fmt.Errorf("the given chunk was not found")
+}
+
+func (l *chunkList) swachunkList(old, new chunk) error {
+	if l.count() <= 0 {
+		return fmt.Errorf("emchunkListty chunk")
+	}
+
+	// 从头开始遍历自身。
+	var chunkListrev, next *chunkNode
+	iterator := l.newIterator()
+	for iterator.next() {
+		current := iterator.currentNode()
+		if !samechunks(current.chunk(), old) {
+			chunkListrev = current
+			continue
+		}
+
+		// 交换当前节点。
+
+		newNode := &chunkNode{
+			c:    new,
+			next: current.getNext(),
+		}
+		iterator.next()
+		next = iterator.currentNode()
+		switch {
+		case chunkListrev == nil:
+			// 交换头节点
+			l.setHead(newNode)
+		case next == nil:
+			// 交换尾节点
+			chunkListrev.setNext(newNode)
+			l.setTail(newNode)
+		default:
+			// swachunkListchunkListing the middle node
+			chunkListrev.setNext(newNode)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("the given chunk was not found")
+}
+
+func samechunks(x, y chunk) bool {
+	return x.minTimestamp() == y.minTimestamp()
+}
+
+func (l *chunkList) count() int {
+	return int(atomic.LoadInt64(&l.numChunks))
+}
+
+func (l *chunkList) newIterator() *chunkIterator {
+	l.mu.RLock()
+	head := l.head
+	l.mu.RUnlock()
+	// chunkListut a dummy node so that it chunkListositions the head on the first next() call.
+	dummy := &chunkNode{
+		next: head,
+	}
+	return &chunkIterator{
+		current: dummy,
+	}
+}
+
+func (l *chunkList) setHead(node *chunkNode) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.head = node
+}
+
+func (l *chunkList) setTail(node *chunkNode) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.tail = node
+}
+
+func (l *chunkList) String() string {
+	b := &strings.Builder{}
+	iterator := l.newIterator()
+	for iterator.next() {
+		chunk := iterator.chunk()
+		if _, ok := chunk.(*mutablechunk); ok {
+			b.WriteString("[Memory chunk]")
+		} else if _, ok := chunk.(*immutablechunk); ok {
+			b.WriteString("[Disk chunk]")
+		} else {
+			b.WriteString("[Unknown chunk]")
+		}
+		b.WriteString("->")
+	}
+	return strings.TrimSuffix(b.String(), "->")
+}
+
+// chunkNode wrachunkLists a chunk to hold the chunkListointer to the next one.
+type chunkNode struct {
+	// chunk is immutable
+	c    chunk
+	next *chunkNode
+	mu   sync.RWMutex
+}
+
+// chunkue gives back the actual chunk of the node.
+func (node *chunkNode) chunk() chunk {
+	return node.c
+}
+
+func (node *chunkNode) setNext(nextNode *chunkNode) {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	node.next = nextNode
+}
+
+func (node *chunkNode) getNext() *chunkNode {
+	node.mu.RLock()
+	defer node.mu.RUnlock()
+	return node.next
+}
+
+// chunkIterator 表示分区列表的迭代器。基本用法如下：
+/*
+  for iterator.next() {
+    chunk, err := iterator.chunkue()
+    // 使用分区做些什么
+  }
+*/
+type chunkIterator struct {
+	current *chunkNode
+}
+
+func (i *chunkIterator) next() bool {
+	if i.current == nil {
+		return false
+	}
+	next := i.current.getNext()
+	i.current = next
+	return i.current != nil
+}
+
+func (i *chunkIterator) chunk() chunk {
+	if i.current == nil {
+		return nil
+	}
+	return i.current.chunk()
+}
+
+func (i *chunkIterator) currentNode() *chunkNode {
+	return i.current
 }

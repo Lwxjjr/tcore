@@ -1,5 +1,5 @@
 // core/catalog.go
-package core
+package tcore
 
 import (
 	"encoding/binary"

@@ -1,4 +1,4 @@
-package core
+package tcore
 
 import "time"
 
@@ -20,10 +20,10 @@ type Options struct {
 // DefaultOptions 返回默认配置选项
 func DefaultOptions() *Options {
 	return &Options{
-		DirPath:             "/tmp/bitcask-iot",
-		MaxSegmentSize:      256 * 1024 * 1024, // 256MB
-		ForceFlushInterval:  60 * time.Second,
-		BlockMaxPoints:      1000,
+		DirPath:            "/tmp/bitcask-iot",
+		MaxSegmentSize:     256 * 1024 * 1024, // 256MB
+		ForceFlushInterval: 60 * time.Second,
+		BlockMaxPoints:     1000,
 	}
 }
 
