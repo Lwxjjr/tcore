@@ -21,7 +21,7 @@ type chunk interface {
 	// maxTimestamp 返回最大的 Unix 时间戳（毫秒）。
 	maxTimestamp() int64
 	// count 返回分区持有的数据点数量。
-	count() int
+	count() int64
 	// active 表示不仅可写，还具有作为头部分区的特性。
 	active() bool
 	// expired 表示应该被删除。

@@ -1,6 +1,9 @@
 package tcore
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 type mutableChunk struct {
 	numPoints int64
@@ -15,7 +18,10 @@ func newMutableChunk() chunk {
 }
 
 func (chunk *mutableChunk) insertRows(rows []Row) (outdatedRows []Row, err error) {
-
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("no rows given")
+	}
+	return nil, nil
 }
 
 func (chunk *mutableChunk) clean() error {
@@ -25,6 +31,7 @@ func (chunk *mutableChunk) clean() error {
 
 func (chunk *mutableChunk) selectDataPoints(metric string, labels []Label, start, end int64) ([]*DataPoint, error) {
 
+	return nil, nil
 }
 
 func (chunk *mutableChunk) minTimestamp() int64 {
