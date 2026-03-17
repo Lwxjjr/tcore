@@ -1,5 +1,10 @@
 package tcore
 
+import (
+	"sort"
+	"strings"
+)
+
 const (
 	maxLabelNameLen  = 256
 	maxLabelValueLen = 16 * 1024
@@ -25,8 +30,29 @@ type Label struct {
 	Value string
 }
 
-// marshalMetricName 通过编码标签来构建唯一的字节。
-func marshalMetricName(metric string, labels []Label) string {
-	// TODO
-	return ""
+// marshalKey 通过编码标签来构建唯一的字节。
+func marshalKey(metric string, labels []Label) string {
+	// 如果没有标签，直接返回指标名称
+	if len(labels) == 0 {
+		return metric
+	}
+
+	// 复制并排序标签以确保生成的键是确定性的（即相同的标签组合产生相同的字符串）
+	sortedLabels := make([]Label, len(labels))
+	copy(sortedLabels, labels)
+	sort.Slice(sortedLabels, func(i, j int) bool {
+		return sortedLabels[i].Name < sortedLabels[j].Name
+	})
+
+	// 使用 strings.Builder 高效构建字符串
+	var sb strings.Builder
+	sb.WriteString(metric)
+	for _, l := range sortedLabels {
+		// 使用 \x00 分隔标签名，\x01 分隔标签值，确保编码的唯一性
+		sb.WriteByte('\x00')
+		sb.WriteString(l.Name)
+		sb.WriteByte('\x01')
+		sb.WriteString(l.Value)
+	}
+	return sb.String()
 }
