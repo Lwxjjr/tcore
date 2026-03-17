@@ -10,7 +10,7 @@ type mutableChunk struct {
 	numPoints int64
 	minT      int64
 	maxT      int64
-	metrics   sync.Map
+	seriesMap sync.Map // 时间序列表
 	duration  int64
 	once      sync.Once
 }
@@ -37,25 +37,25 @@ func (chunk *mutableChunk) insertRows(rows []Row) (outdatedRows []Row, err error
 	})
 
 	// 遍历所有行，过滤过期数据并插入有效数据
+	var maxTimestamp int64
+	var validRowsNum int64
+
 	for _, row := range rows {
 		// 如果时间戳早于当前最小时间戳，返回过期数据
-		if row.Timestamp < atomic.LoadInt64(&chunk.minT) {
+		if row.Timestamp < chunk.minTimestamp() {
 			outdatedRows = append(outdatedRows, row)
 			continue
 		}
 
-		// 更新最大时间戳
-		currentMax := atomic.LoadInt64(&chunk.maxT)
-		if row.Timestamp > currentMax {
-			atomic.StoreInt64(&chunk.maxT, row.Timestamp)
+		// 追踪最大时间戳（非原子操作）
+		if row.Timestamp > maxTimestamp {
+			maxTimestamp = row.Timestamp
 		}
 
 		// 生成唯一标识符
-		metricKey := marshalMetricName(row.Metric, row.Labels)
+		key := marshalKey(row.Metric, row.Labels)
 
-		// 获取或创建该 metric 的数据点列表
-		value, _ := chunk.metrics.LoadOrStore(metricKey, &[]*DataPoint{})
-		dataPoints := value.(*[]*DataPoint)
+		// 获取或创建该 metricKey 的数据点列表
 
 		// 插入数据点
 		newDataPoint := &DataPoint{
@@ -64,8 +64,22 @@ func (chunk *mutableChunk) insertRows(rows []Row) (outdatedRows []Row, err error
 		}
 		*dataPoints = append(*dataPoints, newDataPoint)
 
-		// 更新计数器
-		atomic.AddInt64(&chunk.numPoints, 1)
+		validRowsNum++
+	}
+
+	// 统一更新最大时间戳和计数器（减少原子操作）
+	if validRowsNum > 0 {
+		// 使用 CAS 循环更新 maxT，保证并发安全
+		for {
+			oldMax := atomic.LoadInt64(&chunk.maxT)
+			if maxTimestamp <= oldMax {
+				break
+			}
+			if atomic.CompareAndSwapInt64(&chunk.maxT, oldMax, maxTimestamp) {
+				break
+			}
+		}
+		atomic.AddInt64(&chunk.numPoints, validRowsNum)
 	}
 
 	return outdatedRows, nil
@@ -99,4 +113,27 @@ func (chunk *mutableChunk) active() bool {
 
 func (chunk *mutableChunk) expired() bool {
 	return false
+}
+
+func (chunk *mutableChunk) getSeries(key string) *series {
+	if value, ok := chunk.seriesMap.Load(key); ok {
+		return value.(*series)
+	}
+	newSeries := &series{
+		inOrderPoints:    make([]*DataPoint, 0, 1000),
+		outOfOrderPoints: make([]*DataPoint, 0),
+	}
+	value, _ := chunk.seriesMap.LoadOrStore(key, newSeries)
+	return value.(*series)
+}
+
+// series 代表内存中一条独立的时间序列
+// 只负责单一时间轴的数据点管理，不包含任何路由逻辑
+type series struct {
+	mu               *sync.RWMutex
+	key              string
+	inOrderPoints    []*DataPoint // 有序点位
+	outOfOrderPoints []*DataPoint // 乱序点位
+	minT             int64
+	maxT             int64
 }
