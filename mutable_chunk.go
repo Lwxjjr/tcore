@@ -2,6 +2,7 @@ package tcore
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 )
@@ -57,20 +58,7 @@ func (chunk *mutableChunk) insertRows(rows []Row) (outdatedRows []Row, err error
 
 		// 获取或创建该 metricKey 的数据点列表
 		series := chunk.getSeries(key)
-
-		// 插入点位
-		count := atomic.LoadInt64(&series.count)
-		series.mu.Lock()
-		defer series.mu.Unlock()
-		// 顺序插入
-		if series.inOrderPoints[count-1].Timestamp < row.DataPoint.Timestamp {
-			series.inOrderPoints = append(series.inOrderPoints, &row.DataPoint)
-			atomic.StoreInt64(&series.maxT, row.DataPoint.Timestamp)
-			atomic.AddInt64(&series.count, 1)
-			return
-		}
-		// 乱序超出
-		series.outOfOrderPoints = append(series.outOfOrderPoints, &row.DataPoint)
+		series.insertPoint(&row.DataPoint)
 		validRowsNum++
 	}
 
@@ -98,8 +86,9 @@ func (chunk *mutableChunk) clean() error {
 }
 
 func (chunk *mutableChunk) selectDataPoints(metric string, labels []Label, start, end int64) ([]*DataPoint, error) {
-
-	return nil, nil
+	key := marshalKey(metric, labels)
+	series := chunk.getSeries(key)
+	return series.selectPoints(start, end), nil
 }
 
 func (chunk *mutableChunk) minTimestamp() int64 {
@@ -144,4 +133,41 @@ type series struct {
 	minT             int64
 	maxT             int64
 	count            int64
+}
+
+func (s *series) insertPoint(point *DataPoint) {
+	// 插入点位
+	count := atomic.LoadInt64(&s.count)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 顺序插入
+	if s.inOrderPoints[count-1].Timestamp < point.Timestamp {
+		s.inOrderPoints = append(s.inOrderPoints, point)
+		atomic.StoreInt64(&s.maxT, point.Timestamp)
+		atomic.AddInt64(&s.count, 1)
+		return
+	}
+	// 乱序超出
+	s.outOfOrderPoints = append(s.outOfOrderPoints, point)
+}
+
+func (s *series) selectPoints(start, end int64) []*DataPoint {
+	count := atomic.LoadInt64(&s.count)
+	minTimestamp := atomic.LoadInt64(&s.minT)
+	maxTimestamp := atomic.LoadInt64(&s.maxT)
+	if end <= minTimestamp || start >= maxTimestamp {
+		return []*DataPoint{}
+	}
+
+	var startIdx, endIdx int
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	// 通过 points 的有序性，二分查找获取开始索引
+	startIdx = sort.Search(int(count), func(i int) bool {
+		return s.inOrderPoints[i].Timestamp >= start
+	})
+	endIdx = sort.Search(int(count), func(i int) bool {
+		return s.inOrderPoints[i].Timestamp >= end
+	})
+	return s.inOrderPoints[startIdx:endIdx]
 }
