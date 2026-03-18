@@ -56,14 +56,21 @@ func (chunk *mutableChunk) insertRows(rows []Row) (outdatedRows []Row, err error
 		key := marshalKey(row.Metric, row.Labels)
 
 		// 获取或创建该 metricKey 的数据点列表
+		series := chunk.getSeries(key)
 
-		// 插入数据点
-		newDataPoint := &DataPoint{
-			Value:     row.Value,
-			Timestamp: row.Timestamp,
+		// 插入点位
+		count := atomic.LoadInt64(&series.count)
+		series.mu.Lock()
+		defer series.mu.Unlock()
+		// 顺序插入
+		if series.inOrderPoints[count-1].Timestamp < row.DataPoint.Timestamp {
+			series.inOrderPoints = append(series.inOrderPoints, &row.DataPoint)
+			atomic.StoreInt64(&series.maxT, row.DataPoint.Timestamp)
+			atomic.AddInt64(&series.count, 1)
+			return
 		}
-		*dataPoints = append(*dataPoints, newDataPoint)
-
+		// 乱序超出
+		series.outOfOrderPoints = append(series.outOfOrderPoints, &row.DataPoint)
 		validRowsNum++
 	}
 
@@ -136,4 +143,5 @@ type series struct {
 	outOfOrderPoints []*DataPoint // 乱序点位
 	minT             int64
 	maxT             int64
+	count            int64
 }
