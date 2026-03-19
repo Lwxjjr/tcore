@@ -69,7 +69,13 @@ func openImmutableChunk(dirPath string, retention time.Duration) (chunk, error) 
 		return nil, errors.New("no data points found")
 	}
 
-	mmap, err := syscall.Mmap(int(f.Fd()), int(info.Size()))
+	// 将磁盘文件映射为读入内存的字节数组
+	// 1. f.Fd()：映射文件
+	// 2. 0：偏移量
+	// 3. info.Size()：映射长度
+	// 4. syscall.PROT_READ：磁盘只读
+	// 5. syscall.MAP_SHARED：共享映射
+	mmap, err := syscall.Mmap(int(f.Fd()), 0, int(info.Size()), syscall.PROT_READ, syscall.MAP_SHARED)
 	if err != nil {
 		return nil, fmt.Errorf("failed to perform mmap: %w", err)
 	}
@@ -122,10 +128,10 @@ func (chunk *immutableChunk) selectDataPoints(metric string, labels []Label, sta
 	if _, err := r.Seek(seriesIndex.Offset, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("failed to seek: %w", err)
 	}
-	// 3. 为该指标数据流创建一个新的系列解码器（Series Decoder）
+	// 3. 为该指标数据流创建一个新的序列解码器（Series Decoder）
 	decoder, err := newSeriesDecoder(r)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate decoder for metric %q in %q: %w", name, d.dirPath, err)
+		return nil, fmt.Errorf("failed to generate decoder for metric %q in %q: %w", key, chunk.dirPath, err)
 	}
 
 	// 4. 预先分配存储结果的切片，容量设置为该指标在该分区的总点数（避免频繁扩容）
@@ -135,7 +141,7 @@ func (chunk *immutableChunk) selectDataPoints(metric string, labels []Label, sta
 
 		// 从流中解码出一个数据点
 		if err := decoder.decodePoint(point); err != nil {
-			return nil, fmt.Errorf("解码分区 %q 中指标 %q 的数据点失败: %w", name, d.dirPath, err)
+			return nil, fmt.Errorf("解码分区 %q 中指标 %q 的数据点失败: %w", key, chunk.dirPath, err)
 		}
 
 		// 时间范围过滤：
