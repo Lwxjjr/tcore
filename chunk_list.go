@@ -35,7 +35,7 @@ type chunkList struct {
 	mu        sync.RWMutex
 }
 
-func newchunkList() *chunkList {
+func newChunkList() *chunkList {
 	return &chunkList{}
 }
 
