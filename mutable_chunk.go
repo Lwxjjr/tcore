@@ -5,19 +5,42 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type mutableChunk struct {
 	numPoints int64
 	minT      int64
 	maxT      int64
-	seriesMap sync.Map // 时间序列表
-	duration  int64
+
+	// 时间序列表
+	seriesMap sync.Map
 	once      sync.Once
+
+	// duration 指定分区时间戳的范围
+	duration int64
+	// timestampPrecision 指定时间精度，支持纳秒、微秒、毫秒、秒
+	timestampPrecision TimestampPrecision
 }
 
-func newMutableChunk() chunk {
-	return &mutableChunk{}
+func newMutableChunk(duration time.Duration, precision TimestampPrecision) chunk {
+	var d int64
+	switch precision {
+	case Nanoseconds:
+		d = duration.Microseconds()
+	case Microseconds:
+		d = duration.Microseconds()
+	case Milliseconds:
+		d = duration.Milliseconds()
+	case Seconds:
+		d = int64(duration.Seconds())
+	default:
+		d = duration.Nanoseconds()
+	}
+	return &mutableChunk{
+		duration:           d,
+		timestampPrecision: precision,
+	}
 }
 
 func (chunk *mutableChunk) insertRows(rows []Row) (outdatedRows []Row, err error) {
@@ -130,8 +153,8 @@ type series struct {
 	key              string
 	inOrderPoints    []*DataPoint // 有序点位
 	outOfOrderPoints []*DataPoint // 乱序点位
-	minT             int64
-	maxT             int64
+	minTimeStamp     int64
+	maxTimeStamp     int64
 	count            int64
 }
 
@@ -143,7 +166,7 @@ func (s *series) insertPoint(point *DataPoint) {
 	// 顺序插入
 	if s.inOrderPoints[count-1].Timestamp < point.Timestamp {
 		s.inOrderPoints = append(s.inOrderPoints, point)
-		atomic.StoreInt64(&s.maxT, point.Timestamp)
+		atomic.StoreInt64(&s.maxTimeStamp, point.Timestamp)
 		atomic.AddInt64(&s.count, 1)
 		return
 	}
@@ -153,8 +176,8 @@ func (s *series) insertPoint(point *DataPoint) {
 
 func (s *series) selectPoints(start, end int64) []*DataPoint {
 	count := atomic.LoadInt64(&s.count)
-	minTimestamp := atomic.LoadInt64(&s.minT)
-	maxTimestamp := atomic.LoadInt64(&s.maxT)
+	minTimestamp := atomic.LoadInt64(&s.minTimeStamp)
+	maxTimestamp := atomic.LoadInt64(&s.maxTimeStamp)
 	if end <= minTimestamp || start >= maxTimestamp {
 		return []*DataPoint{}
 	}
@@ -170,4 +193,42 @@ func (s *series) selectPoints(start, end int64) []*DataPoint {
 		return s.inOrderPoints[i].Timestamp >= end
 	})
 	return s.inOrderPoints[startIdx:endIdx]
+}
+
+func (s *series) encode(encoder seriesEncoder) error {
+	// 排序乱序点
+	sort.Slice(s.outOfOrderPoints, func(i, j int) bool {
+		return s.outOfOrderPoints[i].Timestamp < s.outOfOrderPoints[j].Timestamp
+	})
+
+	// 将两个“子序列”合并成一个全局有序的“大序列”
+	var outIndex, inIndex int
+	for outIndex < len(s.outOfOrderPoints) && inIndex < len(s.inOrderPoints) {
+		if s.outOfOrderPoints[outIndex].Timestamp < s.inOrderPoints[inIndex].Timestamp {
+			if err := encoder.encodePoint(s.outOfOrderPoints[outIndex]); err != nil {
+				return err
+			}
+			outIndex++
+		} else {
+			if err := encoder.encodePoint(s.inOrderPoints[inIndex]); err != nil {
+				return err
+			}
+			inIndex++
+		}
+	}
+
+	// 处理剩余点
+	for outIndex < len(s.outOfOrderPoints) {
+		if err := encoder.encodePoint(s.outOfOrderPoints[outIndex]); err != nil {
+			return err
+		}
+		outIndex++
+	}
+	for inIndex < len(s.inOrderPoints) {
+		if err := encoder.encodePoint(s.inOrderPoints[inIndex]); err != nil {
+			return err
+		}
+		inIndex++
+	}
+	return nil
 }
