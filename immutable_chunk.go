@@ -66,7 +66,7 @@ func openImmutableChunk(dirPath string, retention time.Duration) (chunk, error) 
 		return nil, fmt.Errorf("failed to fetch file info: %w", err)
 	}
 	if info.Size() == 0 {
-		return nil, errors.New("no data points found")
+		return nil, ErrNoDataPoints
 	}
 
 	// 将磁盘文件映射为读入内存的字节数组
