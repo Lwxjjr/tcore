@@ -12,10 +12,14 @@ import (
 	"sync"
 	"time"
 
+	timerpool "github.com/Lwxjjr/tcore/internal/timepool"
 	_ "go.uber.org/automaxprocs"
 )
 
-var defaultWorkersLimit = runtime.GOMAXPROCS(0)
+var (
+	defaultWorkersLimit = runtime.GOMAXPROCS(0)
+	ErrNoDataPoints     = errors.New("no data points found")
+)
 
 // TimestampPrecision 时间精度
 type TimestampPrecision string
@@ -94,14 +98,47 @@ func (s *storage) InsertRows(rows []Row) error {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
+	insert := func() error {
+		defer func() { <-s.workersLimitCh }()
+		if err := s.ensureActive(); err != nil {
+			return err
+		}
+		iterator := s.chunkList.newIterator()
+		n := s.chunkList.count()
+		rowsToInsert := rows
+		for i := 0; i < n && i < mutableChunkNum; i++ {
+			if len(rowsToInsert) == 0 {
+				break
+			}
+			if !iterator.next() {
+				break
+			}
+			outdatedRows, err := iterator.chunk().insertRows(rowsToInsert)
+			if err != nil {
+				return fmt.Errorf("failed to insert rows: %w", err)
+			}
+			rowsToInsert = outdatedRows
+		}
+		return nil
+	}
 	// 限制并发 goroutine 的数量
 	select {
 	case s.workersLimitCh <- struct{}{}:
-		return nil
+		return insert()
 	default:
 	}
 
-	return nil
+	// 所有 worker 都很忙，最多等待 writeTimeout
+	t := timerpool.Get(s.writeTimeout)
+	select {
+	case s.workersLimitCh <- struct{}{}:
+		timerpool.Put(t)
+		return insert()
+	case <-t.C:
+		timerpool.Put(t)
+		return fmt.Errorf("failed to write a data point in %s, since it is overloaded with %d concurrent writers",
+			s.writeTimeout, defaultWorkersLimit)
+	}
 }
 
 func (s *storage) Select(metric string, labels []Label, start, end int64) ([]*DataPoint, error) {
@@ -164,14 +201,13 @@ func (s *storage) flushChunk() error {
 
 		// 尝试将可变块转换为不可变块
 		// 磁盘分区将放置在内存分区所在的位置
-
 		dir := filepath.Join(s.dataPath, fmt.Sprintf("p-%d-%d", mutableChunk.minTimestamp(), mutableChunk.maxTimestamp()))
 		if err := s.flush(dir, mutableChunk); err != nil {
 			return fmt.Errorf("failed to flush chunk into %s: %w", dir, err)
 		}
 
 		newChunk, err := openImmutableChunk(dir, s.retention)
-		if errors.Is(err, errors.New("no data points found")) {
+		if errors.Is(err, ErrNoDataPoints) {
 			if err := s.chunkList.remove(chunk); err != nil {
 				return fmt.Errorf("failed to remove chunk: %w", err)
 			}
