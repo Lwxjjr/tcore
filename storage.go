@@ -8,7 +8,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 var (
 	defaultWorkersLimit = runtime.GOMAXPROCS(0)
 	ErrNoDataPoints     = errors.New("no data points found")
+	chunkDirRegex       = regexp.MustCompile(`^p-.+`)
 )
 
 // TimestampPrecision 时间精度
@@ -30,10 +33,11 @@ const (
 	Milliseconds TimestampPrecision = "ms"
 	Seconds      TimestampPrecision = "s"
 
-	defaultDuration     = 1 * time.Hour
-	defaultRetention    = 168 * time.Hour
-	defaultWriteTimeout = 15 * time.Second
-	mutableChunkNum     = 2
+	defaultDuration      = 1 * time.Hour
+	defaultRetention     = 168 * time.Hour
+	defaultWriteTimeout  = 15 * time.Second
+	mutableChunkNum      = 2
+	checkExpiredInterval = time.Hour
 )
 
 type Storage interface {
@@ -90,6 +94,66 @@ func NewStorage() (Storage, error) {
 	if err := os.MkdirAll(s.dataPath, fs.ModePerm); err != nil {
 		return nil, fmt.Errorf("failed to make data directory %s: %w", s.dataPath, err)
 	}
+
+	// 从磁盘加载已经存在的分区数据
+	dirs, err := os.ReadDir(s.dataPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open data directory: %w", err)
+	}
+	if len(dirs) == 0 {
+		s.newChunk(nil)
+		return s, nil
+	}
+
+	// 过滤以p开头的数据分区目录
+	isChunkDir := func(f fs.DirEntry) bool {
+		return f.IsDir() && chunkDirRegex.MatchString(f.Name())
+	}
+
+	chunks := make([]chunk, 0, len(dirs))
+	for _, e := range dirs {
+		if !isChunkDir(e) {
+			continue
+		}
+		path := filepath.Join(s.dataPath, e.Name())
+		// 尝试打开磁盘分区
+		immutableChunk, err := openImmutableChunk(path, s.retention)
+		if errors.Is(err, ErrNoDataPoints) {
+			continue // 空分区直接跳过
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to open immutable chunk for %s: %w", path, err)
+		}
+		chunks = append(chunks, immutableChunk)
+	}
+
+	// 按时间戳对分区排序
+	sort.Slice(chunks, func(i, j int) bool {
+		return chunks[i].minTimestamp() < chunks[j].minTimestamp()
+	})
+	for _, chunk := range chunks {
+		s.newChunk(chunk)
+	}
+
+	// 创建一个新的活跃分区用于接收新写入
+	s.newChunk(nil)
+
+	// 后台清理任务：定期检查并删除
+	go func() {
+		ticker := time.NewTicker(checkExpiredInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.doneCh:
+				return
+			case <-ticker.C:
+				err := s.removeExpiredChunks()
+				if err != nil {
+					fmt.Printf("%v\n", err)
+				}
+			}
+		}
+	}()
 
 	return s, nil
 }
@@ -303,5 +367,38 @@ func (s *storage) flush(dirPath string, chunk *mutableChunk) error {
 		return fmt.Errorf("failed to write metadata to %s: %w", metaPath, err)
 	}
 
+	return nil
+}
+
+func (s *storage) removeExpiredChunks() error {
+	expiredList := make([]chunk, 0)
+
+	// 创建分区列表迭代器，从最新到最旧遍历所有分区
+	iterator := s.chunkList.newIterator()
+
+	// 检查所有分区的过期状态
+	for iterator.next() {
+		chunk := iterator.chunk()
+		if chunk == nil {
+			return fmt.Errorf("unexpected nil chunk found")
+		}
+
+		// 检查分片是否已过期
+		// 过期判断基于配置的 retention 时间
+		// 内存分片永远不会过期（expired() 函数返回 false）
+		// 磁盘分片会根据创建时间检查是否超过 retention
+		if chunk.expired() {
+			// 将过期的分片添加到待删除列表
+			expiredList = append(expiredList, chunk)
+		}
+	}
+
+	for i := range expiredList {
+		if err := s.chunkList.remove(expiredList[i]); err != nil {
+			return fmt.Errorf("failed to remove expired chunk")
+		}
+		// 注意：磁盘分片在移除时，其对应的文件也会被删除
+		// 这是通过 diskChunk 的 clean() 方法实现的
+	}
 	return nil
 }
