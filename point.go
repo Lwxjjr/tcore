@@ -30,29 +30,53 @@ type Label struct {
 	Value string
 }
 
-// marshalKey 通过编码标签来构建唯一的字节。
 func marshalKey(metric string, labels []Label) string {
-	// 如果没有标签，直接返回指标名称
 	if len(labels) == 0 {
 		return metric
 	}
 
-	// 复制并排序标签以确保生成的键是确定性的（即相同的标签组合产生相同的字符串）
-	sortedLabels := make([]Label, len(labels))
-	copy(sortedLabels, labels)
-	sort.Slice(sortedLabels, func(i, j int) bool {
-		return sortedLabels[i].Name < sortedLabels[j].Name
+	// 1. 原地排序
+	sort.Slice(labels, func(i, j int) bool {
+		return labels[i].Name < labels[j].Name
 	})
 
-	// 使用 strings.Builder 高效构建字符串
-	var sb strings.Builder
-	sb.WriteString(metric)
-	for _, l := range sortedLabels {
-		// 使用 \x00 分隔标签名，\x01 分隔标签值，确保编码的唯一性
-		sb.WriteByte('\x00')
-		sb.WriteString(l.Name)
-		sb.WriteByte('\x01')
-		sb.WriteString(l.Value)
+	// 2. 预估容量（稍微多给一点，抵消转义带来的长度增加）
+	size := len(metric) + 2
+	for _, l := range labels {
+		size += len(l.Name) + len(l.Value) + 10 // 10 包含了 ="" 和 , 以及潜在的转义字符
 	}
+
+	// 使用 Grow 函数一次性分配内存
+	var sb strings.Builder
+	sb.Grow(size)
+
+	sb.WriteString(metric)
+	sb.WriteByte('{')
+
+	for i, l := range labels {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(l.Name)
+		sb.WriteString(`="`)
+
+		// 核心优化：按字节遍历，手动转义，无额外内存分配
+		for j := 0; j < len(l.Value); j++ {
+			b := l.Value[j]
+			switch b {
+			case '"', '\\': // 处理引号和反斜杠
+				sb.WriteByte('\\')
+				sb.WriteByte(b)
+			case '\n': // 处理换行符 (Prometheus 标准)
+				sb.WriteString(`\n`)
+			default:
+				sb.WriteByte(b)
+			}
+		}
+
+		sb.WriteByte('"')
+	}
+	sb.WriteByte('}')
+
 	return sb.String()
 }
