@@ -205,13 +205,26 @@ func (s *storage) InsertRows(rows []Row) error {
 	}
 }
 
-func (s *storage) Select(metric string, labels []Label, start, end int64) ([]*DataPoint, error) {
-
+func (s *storage) Select(metric string, labels []Label, start, end int64) (points []*DataPoint, err error) {
 	return nil, nil
 }
 
 func (s *storage) Close() error {
-	// TODO
+	s.wg.Wait()
+	close(s.doneCh)
+
+	// 插入两个空分区，使所有可写分区变为只读
+	// 因为在 flushChunk，会跳过两个分区，因此需要插入两个空分区
+	for i := 0; i < mutableChunkNum; i++ {
+		s.newChunk(nil)
+	}
+	if err := s.flushChunk(); err != nil {
+		return fmt.Errorf("failed to close storage: %w", err)
+	}
+	if err := s.removeExpiredChunks(); err != nil {
+		return fmt.Errorf("failed to remove expired chunks: %w", err)
+	}
+
 	return nil
 }
 
