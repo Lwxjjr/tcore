@@ -5,11 +5,6 @@ import (
 	"strings"
 )
 
-const (
-	maxLabelNameLen  = 256
-	maxLabelValueLen = 16 * 1024
-)
-
 // Row 包含一个数据点以及用于标识一种指标的属性
 type Row struct {
 	Metric string  // 指标的唯一名称，必须设置此字段

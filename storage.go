@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	timerpool "github.com/Lwxjjr/tcore/internal/timepool"
+	timerpool "github.com/Lwxjjr/tcore/timepool"
 	_ "go.uber.org/automaxprocs"
 )
 
