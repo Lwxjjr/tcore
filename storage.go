@@ -81,7 +81,7 @@ type storage struct {
 	// logger 日志
 }
 
-func NewStorage() (Storage, error) {
+func NewStorage(opts ...Option) (Storage, error) {
 	s := &storage{
 		chunkList:      newChunkList(),
 		duration:       defaultDuration,
