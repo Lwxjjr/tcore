@@ -71,6 +71,10 @@ func (chunk *mutableChunk) insertRows(rows []Row) (outdatedRows []Row, err error
 			continue
 		}
 
+		if row.Timestamp == 0 {
+			row.Timestamp = toUnix(time.Now(), chunk.timestampPrecision)
+		}
+
 		// 追踪最大时间戳（非原子操作）
 		if row.Timestamp > maxTimestamp {
 			maxTimestamp = row.Timestamp
@@ -231,4 +235,19 @@ func (s *series) encode(encoder seriesEncoder) error {
 		inIndex++
 	}
 	return nil
+}
+
+func toUnix(t time.Time, precision TimestampPrecision) int64 {
+	switch precision {
+	case Nanoseconds:
+		return t.UnixNano()
+	case Microseconds:
+		return t.UnixNano() / 1e3
+	case Milliseconds:
+		return t.UnixNano() / 1e6
+	case Seconds:
+		return t.Unix()
+	default:
+		return t.UnixNano()
+	}
 }
