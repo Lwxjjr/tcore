@@ -143,6 +143,7 @@ func (chunk *mutableChunk) getSeries(key string) *series {
 		return value.(*series)
 	}
 	newSeries := &series{
+		mu:               &sync.RWMutex{},
 		inOrderPoints:    make([]*DataPoint, 0, 1000),
 		outOfOrderPoints: make([]*DataPoint, 0),
 	}
@@ -163,18 +164,19 @@ type series struct {
 }
 
 func (s *series) insertPoint(point *DataPoint) {
-	// 插入点位
-	count := atomic.LoadInt64(&s.count)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// 顺序插入
-	if s.inOrderPoints[count-1].Timestamp < point.Timestamp {
+
+	n := len(s.inOrderPoints)
+	if n == 0 || s.inOrderPoints[n-1].Timestamp <= point.Timestamp {
 		s.inOrderPoints = append(s.inOrderPoints, point)
-		atomic.StoreInt64(&s.maxTimeStamp, point.Timestamp)
-		atomic.AddInt64(&s.count, 1)
+		if n == 0 {
+			s.minTimeStamp = point.Timestamp
+		}
+		s.maxTimeStamp = point.Timestamp
+		s.count++
 		return
 	}
-	// 乱序超出
 	s.outOfOrderPoints = append(s.outOfOrderPoints, point)
 }
 
